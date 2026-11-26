@@ -68,9 +68,10 @@ def main():
     cfg = json.loads(Path("config.json").read_text())
     templates = json.loads(Path("templates.json").read_text())
     method = cfg.get("method", "fsol")
-    if method not in {"fsol", "memory", "memory_matched"}:
+    if method not in {"fsol", "memory", "memory_matched", "zero"}:
         raise ValueError("unknown Writing method")
     train = method == "fsol"
+    use_memory = method != "zero"
     seed = cfg["seed"]
     torch.manual_seed(seed)
     prompts = list(dict.fromkeys(x.strip() for x in Path("input.txt").read_text().splitlines() if x.strip()))
@@ -87,7 +88,8 @@ def main():
                  gpu_memory_utilization=.20, enable_prefix_caching=False, generation_config="vllm")
     opts = dict(torch_dtype=torch.bfloat16, attn_implementation="sdpa", local_files_only=True)
     judge = AutoModelForCausalLM.from_pretrained("m1", **opts).to("cuda:0").eval()
-    embed = AutoModel.from_pretrained("m2", **opts).to("cuda:0").eval()
+    if use_memory:
+        embed = AutoModel.from_pretrained("m2", **opts).to("cuda:0").eval()
     if train:
         actor = AutoModelForCausalLM.from_pretrained("m0", **opts).to("cuda:1").train()
         actor.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant":False})
@@ -96,14 +98,16 @@ def main():
         optimizer = torch.optim.AdamW(masters, lr=1e-6, betas=(.9,.999), weight_decay=.01, foreach=False)
     memory, vectors, batch = [], [], []
     print("models_ready", flush=True)
-    updates = 0
-    temperature, top_p, top_k = (.7, .8, 20) if method == "memory" else (1., 1., -1)
+    updates = successes = 0
+    temperature, top_p, top_k = (.7, .8, 20) if method in {"memory", "zero"} else (1., 1., -1)
     for i, prompt in enumerate(prompts[:cfg["queries"]]):
         started = time.time()
-        with torch.inference_mode():
-            inputs = embed_tok(prompt,return_tensors="pt",truncation=True,max_length=4096).to(embed.device)
-            vector = F.normalize(embed(**inputs).last_hidden_state[0,-1].float(),dim=0).cpu()
-        indices = (torch.stack(vectors) @ vector).argsort(descending=True,stable=True)[:3].tolist() if vectors else []
+        indices = []
+        if use_memory:
+            with torch.inference_mode():
+                inputs = embed_tok(prompt,return_tensors="pt",truncation=True,max_length=4096).to(embed.device)
+                vector = F.normalize(embed(**inputs).last_hidden_state[0,-1].float(),dim=0).cpu()
+            indices = (torch.stack(vectors) @ vector).argsort(descending=True,stable=True)[:3].tolist() if vectors else []
         task = templates["policy"].replace("{task_description}",prompt)
         def prefix():
             items = [f"Example Query {k}: {memory[j][1]}\n\nExample Response {k}: {memory[j][2]}" for k,j in enumerate(indices,1)]
@@ -134,7 +138,8 @@ def main():
         if train:
             batch.append(row)
         refs = [memory[j][0] for j in indices]
-        if reward:
+        successes += reward
+        if use_memory and reward:
             memory.append((i+1,prompt,passage)); vectors.append(vector)
         log("rows.jsonl",dict(**row,retrieved=refs,verdict=verdict,parse_ok=bool(match),policy_version=updates,
                              retrieval_generation_s=generated-started,judge_s=time.time()-generated))
@@ -148,7 +153,7 @@ def main():
             updates += 1
             batch.clear()
     Path("done.json").write_text(json.dumps(dict(queries=cfg["queries"],updates=updates,
-                                                   pending=len(batch),successes=len(memory),end=time.time())))
+                                                   pending=len(batch),successes=successes,end=time.time())))
 
 
 if __name__=="__main__":
