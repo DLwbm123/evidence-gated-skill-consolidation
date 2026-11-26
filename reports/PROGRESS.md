@@ -18,3 +18,5 @@
 ALFWorld 共 3,553 个训练、200 个 valid_train、140 个 valid_seen 和 134 个 valid_unseen 游戏。六类任务各完成了一次参考动作回放。固定上游 verl-agent 提交 `20bd331bdbc9026a5668e11362178e10ab7400c8` 的技能库适配已通过语法编译。正式阶段按 Pick、Look、Clean、Heat、Cool、Pick2 的顺序评估迁移与遗忘。[ALFWorld](https://github.com/alfworld/alfworld)
 
 双卡短程配置使用 PyTorch 2.8.0+cu128、vLLM 0.11.0、Transformers 4.55.2 和 Ray 2.59.0。以 4 个训练任务、每题 2 条 rollout、6 轮上限检验 trainer 的一次联合更新和 checkpoint 重载。使用 SDPA 和有填充批次，去填充和 GiGPO 辅助依赖按所选路径加载。已排查 Triton 的 Python 3.12 头文件路径和 Ray worker 的解释器路径。双卡首步已写出两份 actor 模型分片、extra state 和投影头 checkpoint，共 14,512,062,120 字节。重载进程在显存预检时退出，张量一致性和连续训练仍待验证。[执行与 checkpoint 核查记录](INITIAL_EXECUTION.md)
+
+已从基础权重启动 ALFWorld 的 100 步共享 GRPO 预热；目标为在第 150 步按论文口径独立评估两组。有关采样和硬件差异见[复现协议与启动记录](ALFWORLD_REPRODUCTION.md)。
