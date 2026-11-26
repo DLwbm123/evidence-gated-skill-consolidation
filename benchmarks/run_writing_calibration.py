@@ -68,7 +68,7 @@ def main():
     cfg = json.loads(Path("config.json").read_text())
     templates = json.loads(Path("templates.json").read_text())
     method = cfg.get("method", "fsol")
-    if method not in {"fsol", "memory"}:
+    if method not in {"fsol", "memory", "memory_matched"}:
         raise ValueError("unknown Writing method")
     train = method == "fsol"
     seed = cfg["seed"]
@@ -97,7 +97,7 @@ def main():
     memory, vectors, batch = [], [], []
     print("models_ready", flush=True)
     updates = 0
-    temperature, top_p, top_k = (1., 1., -1) if train else (.7, .8, 20)
+    temperature, top_p, top_k = (.7, .8, 20) if method == "memory" else (1., 1., -1)
     for i, prompt in enumerate(prompts[:cfg["queries"]]):
         started = time.time()
         with torch.inference_mode():
