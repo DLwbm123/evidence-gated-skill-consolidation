@@ -19,7 +19,7 @@ def log(name, record):
         stream.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
-def batches_update(actor, ref, optimizer, masters, rows):
+def batches_update(actor, ref, optimizer, masters, rows, kl_coefficient):
     rewards = torch.tensor([r["reward"] for r in rows], dtype=torch.float)
     advantages = (rewards - rewards.mean()) / (rewards.std(unbiased=False) + 1e-8)
     count = sum(len(r["tokens"]) for r in rows)
@@ -39,7 +39,7 @@ def batches_update(actor, ref, optimizer, masters, rows):
         mask = torch.ones_like(current)
         pg = compute_policy_loss(old, current, advantage.to(current.device).expand_as(current),
                                  mask, cliprange=.2, clip_ratio_c=float(1e8))[0]
-        loss = (pg + .05 * kl_penalty(current, reference, "low_var_kl").mean()) * (len(actions)/count)
+        loss = (pg + kl_coefficient * kl_penalty(current, reference, "low_var_kl").mean()) * (len(actions)/count)
         loss.backward()
         observed_loss += loss.detach().item()
     norm = torch.nn.utils.clip_grad_norm_(actor.parameters(), 1., error_if_nonfinite=True).item()
@@ -68,10 +68,11 @@ def main():
     cfg = json.loads(Path("config.json").read_text())
     templates = json.loads(Path("templates.json").read_text())
     method = cfg.get("method", "fsol")
-    if method not in {"fsol", "memory", "memory_matched", "zero"}:
+    if method not in {"fsol", "memory", "memory_matched", "zero", "rl"}:
         raise ValueError("unknown Writing method")
-    train = method == "fsol"
-    use_memory = method != "zero"
+    train = method in {"fsol", "rl"}
+    use_memory = method not in {"zero", "rl"}
+    kl_coefficient = .01 if method == "rl" else .05
     seed = cfg["seed"]
     torch.manual_seed(seed)
     prompts = list(dict.fromkeys(x.strip() for x in Path("input.txt").read_text().splitlines() if x.strip()))
@@ -145,7 +146,7 @@ def main():
                              retrieval_generation_s=generated-started,judge_s=time.time()-generated))
         if len(batch)==16:
             begin = time.time()
-            metrics = batches_update(actor, ref, optimizer, masters, batch)
+            metrics = batches_update(actor, ref, optimizer, masters, batch, kl_coefficient)
             publish_weights(actor,live)
             engine.collective_rpc("reload_weights")
             log("updates.jsonl",dict(after_query=i+1,seconds=time.time()-begin,**metrics))
