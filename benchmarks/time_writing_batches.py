@@ -16,7 +16,8 @@ from run_writing_calibration import batches_update, log, publish_weights
 def main():
     root = Path(os.environ["RUN_ALIAS"])
     split = json.loads(Path("split.json").read_text())
-    history = [json.loads(x) for x in Path("history.jsonl").read_text().splitlines()]
+    full = json.loads(Path("config.json").read_text()).get("mode") == "full"
+    history = [] if full else [json.loads(x) for x in Path("history.jsonl").read_text().splitlines()]
     stream = split["stream"]
     assert len(set(stream)) == 4800 and set(split["probe"]).isdisjoint(stream)
     template = json.loads(Path("templates.json").read_text())
@@ -45,17 +46,16 @@ def main():
         return " ".join(text.split()[:500]) if len(text.split())>500 else text
     memory = [(r["i"],stream[r["i"]-1],cap(tok.decode(r["tokens"],skip_special_tokens=True,clean_up_tokenization_spaces=False)))
               for r in history[:192] if r["reward"]]
-    assert len(memory)==62
+    assert len(memory)==(0 if full else 62)
     vectors = [vector(q) for _,q,_ in memory]
     print("models_ready",flush=True)
-    for start in (320,336):
+    def generate(prompts, numbers, *, probe=False, use_memory=True):
         begin = time.monotonic()
-        prompts = stream[start:start+16]
-        queries = [vector(x) for x in prompts]
-        similarities = torch.stack(queries) @ torch.stack(vectors).T
+        queries = [vector(x) for x in prompts] if use_memory else []
+        rankings = ([v.argsort(descending=True,stable=True)[:3].tolist() for v in
+                     (torch.stack(queries) @ torch.stack(vectors).T)] if vectors and use_memory else [[] for _ in prompts])
         prefixes, refs = [], []
-        for prompt, scores in zip(prompts,similarities,strict=True):
-            neighbors = scores.argsort(descending=True,stable=True)[:3].tolist()
+        for prompt, neighbors in zip(prompts,rankings,strict=True):
             while True:
                 items = [f"Example Query {k}: {memory[j][1]}\n\nExample Response {k}: {memory[j][2]}" for k,j in enumerate(neighbors,1)]
                 task = template["policy"].replace("{task_description}",prompt)
@@ -66,9 +66,12 @@ def main():
                 neighbors.pop()
             prefixes.append(dict(prompt_token_ids=ids))
             refs.append([memory[j][0] for j in neighbors])
-        assert all(i<=start for group in refs for i in group)
+        if not probe:
+            assert all(i < numbers[0] for group in refs for i in group)
         prepared=time.monotonic()
-        params=[SamplingParams(seed=start+i,temperature=1.,top_p=1.,top_k=-1,max_tokens=1024,logprobs=0) for i in range(16)]
+        params=[SamplingParams(seed=(10000+n if probe else n-1),temperature=.7 if probe else 1.,
+                               top_p=.8 if probe else 1.,top_k=20 if probe else -1,
+                               max_tokens=1024,logprobs=None if probe else 0) for n in numbers]
         outputs=llm.generate(prefixes,params,use_tqdm=False)
         generated=time.monotonic()
         passages=[cap(o.outputs[0].text) for o in outputs]
@@ -77,29 +80,52 @@ def main():
         with torch.inference_mode():
             judged=judge.generate(**encoded,do_sample=False,max_new_tokens=32,pad_token_id=jt.eos_token_id)
         verdicts=jt.batch_decode(judged[:,encoded.input_ids.size(1):],skip_special_tokens=True)
-        batch=[]; parsed=0
+        rows=[]; parsed=0
         for i,(o,verdict) in enumerate(zip(outputs,verdicts,strict=True)):
             match=re.fullmatch(r"(Classical|Cute|Chuunibyou)\s*,\s*(good|bad)\.?",verdict.strip(),re.I)
             parsed+=int(bool(match))
             reward=int(bool(match and match[1].lower()=="cute" and match[2].lower()=="good"))
-            out=o.outputs[0]; tokens=list(out.token_ids)
-            old=[d[t].logprob for d,t in zip(out.logprobs,tokens,strict=True)]
-            batch.append(dict(prefix=prefixes[i]["prompt_token_ids"],tokens=tokens,old=old,reward=reward))
-            if reward:
-                memory.append((start+i+1,prompts[i],passages[i]));vectors.append(queries[i])
+            out=o.outputs[0];tokens=list(out.token_ids)
+            if probe:
+                rows.append(dict(query=numbers[i],memory=use_memory,reward=reward,parsed=bool(match),refs=refs[i]))
+            else:
+                old=[d[t].logprob for d,t in zip(out.logprobs,tokens,strict=True)]
+                rows.append(dict(prefix=prefixes[i]["prompt_token_ids"],tokens=tokens,old=old,reward=reward))
+                if full:
+                    log("queries.jsonl",dict(query=numbers[i],version=(numbers[i]-1)//16,reward=reward,
+                                             verdict=verdict.strip(),refs=refs[i],tokens=len(tokens)))
+                if reward:
+                    memory.append((numbers[i],prompts[i],passages[i]));vectors.append(queries[i])
+        return rows, refs, parsed, [prepared-begin,generated-prepared,time.monotonic()-generated]
+    for start in (range(0,4800,16) if full else (320,336)):
+        begin=time.monotonic()
+        width=1 if full and start<320 else 16
+        batch=[];refs=[];parsed=0;times=[0.,0.,0.]
+        for pos in range(start,start+16,width):
+            rows,selected,ok,elapsed=generate(stream[pos:pos+width],list(range(pos+1,pos+width+1)))
+            batch.extend(rows);refs.extend(selected);parsed+=ok
+            times=[a+b for a,b in zip(times,elapsed,strict=True)]
         scored=time.monotonic()
         metrics=batches_update(actor,ref,optim,masters,batch,.05)
         updated=time.monotonic()
         publish_weights(actor,live);llm.collective_rpc("reload_weights")
         synced=time.monotonic()
         # These are timing-only copies. The engine now owns the updated GPU weights.
-        for f in live.glob("*.safetensors"):
+        for f in ([] if full and start+16==4800 else live.glob("*.safetensors")):
             assert not f.is_symlink()
             f.unlink()
-        log("timings.jsonl",dict(first=start+1,n=16,parsed=parsed,refs=refs,retrieval_s=prepared-begin,
-                                 generation_s=generated-prepared,judge_s=scored-generated,update_s=updated-scored,
+        log("timings.jsonl",dict(first=start+1,n=16,parsed=parsed,refs=refs,retrieval_s=times[0],
+                                 generation_s=times[1],judge_s=times[2],update_s=updated-scored,
                                  sync_s=synced-updated,total_s=time.monotonic()-begin,**metrics))
-    Path("done.json").write_text(json.dumps(dict(batches=2,end=time.time())))
+        update=start//16+1
+        if full and update%50==0:
+            bank_size=len(memory)
+            for use in (False,True):
+                for pos in range(0,64,16):
+                    results,_,_,_=generate(split["probe"][pos:pos+16],list(range(pos+1,pos+17)),probe=True,use_memory=use)
+                    for item in results: log("probes.jsonl",dict(update=update,**item))
+            assert len(memory)==bank_size
+    Path("done.json").write_text(json.dumps(dict(batches=300 if full else 2,end=time.time())))
 
 
 if __name__=="__main__":
