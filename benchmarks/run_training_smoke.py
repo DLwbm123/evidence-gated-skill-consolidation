@@ -11,6 +11,11 @@ import pyarrow.parquet as pq
 
 
 def main():
+    selected = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if selected is not None and selected.replace(" ", "") != "2,3":
+        raise RuntimeError("the two-GPU smoke requires physical CUDA devices 2,3")
+    os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+    os.environ["CUDA_VISIBLE_DEVICES"] = "2,3"
     reloading = os.environ.get("BENCH_RELOAD") == "1"
     root = Path(os.environ["BENCH_ROOT"])
     launch_file = Path(__file__).resolve().relative_to(root.resolve())
