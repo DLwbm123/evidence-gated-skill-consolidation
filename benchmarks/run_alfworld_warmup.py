@@ -37,6 +37,7 @@ def main():
         "actor_rollout_ref.actor.invalid_action_penalty_coef=0.1",
         "actor_rollout_ref.rollout.name=vllm", "actor_rollout_ref.rollout.tensor_model_parallel_size=1",
         "actor_rollout_ref.rollout.gpu_memory_utilization=0.28", "actor_rollout_ref.rollout.max_num_seqs=16",
+        "actor_rollout_ref.rollout.max_num_batched_tokens=2560",
         "actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1",
         "actor_rollout_ref.rollout.enable_chunked_prefill=False", "actor_rollout_ref.rollout.free_cache_engine=False",
         "actor_rollout_ref.rollout.enforce_eager=False", "actor_rollout_ref.rollout.val_kwargs.do_sample=True",
