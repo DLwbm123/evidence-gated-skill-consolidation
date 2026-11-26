@@ -58,7 +58,7 @@ def disk_usage(work):
     return int(last.split()[0])*1024
 
 
-def watch(work, log, initial_start, pid, offset=0):
+def watch(work, log, initial_start, pid, offset=0, ranks=2):
     from os import kill
     work = work.absolute()
     start = float((work/"start").read_text())
@@ -98,7 +98,7 @@ def watch(work, log, initial_start, pid, offset=0):
             if value.isdecimal():
                 latest = int(value)
                 if latest == 100:
-                    pin_shared(work/"ckpt", 2)
+                    pin_shared(work/"ckpt", ranks)
                     return
                 if latest != promoted and (not generations(retained_dir(work)) or max(steps, default=0) >= latest+9):
                     checkpoint = work/"ckpt"/f"global_step_{latest}"
@@ -109,7 +109,7 @@ def watch(work, log, initial_start, pid, offset=0):
                         print("two generations exceed the working disk allowance", allocated, overhead, flush=True)
                         kill(pid, signal.SIGTERM)
                         return
-                    rotate_fallback(work, latest, 2)
+                    rotate_fallback(work, latest, ranks)
                     promoted = latest
             try:
                 kill(pid, 0)
@@ -125,5 +125,6 @@ if __name__ == "__main__":
     cli.add_argument("start_val", type=float)
     cli.add_argument("supervisor", type=int)
     cli.add_argument("--offset", type=int, default=0)
+    cli.add_argument("--ranks", type=int, choices=(2,4), default=2)
     a = cli.parse_args()
-    watch(a.work, a.log, a.start_val, a.supervisor, a.offset)
+    watch(a.work, a.log, a.start_val, a.supervisor, a.offset, a.ranks)
