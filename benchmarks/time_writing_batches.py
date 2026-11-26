@@ -1,0 +1,106 @@
+"""Time two 16-query Writing batches, starting from an early FSOL checkpoint."""
+import json
+import os
+from pathlib import Path
+import re
+import time
+
+import torch
+import torch.nn.functional as F
+from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer
+from vllm import LLM, SamplingParams
+
+from run_writing_calibration import batches_update, log, publish_weights
+
+
+def main():
+    root = Path(os.environ["RUN_ALIAS"])
+    split = json.loads(Path("split.json").read_text())
+    history = [json.loads(x) for x in Path("history.jsonl").read_text().splitlines()]
+    stream = split["stream"]
+    assert len(set(stream)) == 4800 and set(split["probe"]).isdisjoint(stream)
+    template = json.loads(Path("templates.json").read_text())
+    live = Path("scratch")
+    live.mkdir()
+    for f in Path("initial").iterdir():
+        (live/f.name).symlink_to(Path("..")/f)
+    tok, jt, et = [AutoTokenizer.from_pretrained(s) for s in ("m0", "m1", "m2")]
+    jt.padding_side = "left"
+    opts = dict(torch_dtype=torch.bfloat16,attn_implementation="sdpa")
+    llm = LLM(model=str(root/live), dtype="bfloat16", tensor_parallel_size=1, enforce_eager=True,
+              max_model_len=5120, max_num_seqs=16, max_num_batched_tokens=8192, enable_chunked_prefill=True,
+              gpu_memory_utilization=.25, enable_prefix_caching=False, generation_config="vllm", seed=0)
+    judge = AutoModelForCausalLM.from_pretrained("m1",**opts).to("cuda:0").eval()
+    embed = AutoModel.from_pretrained("m2",**opts).to("cuda:0").eval()
+    actor = AutoModelForCausalLM.from_pretrained("initial",**opts).to("cuda:1").train()
+    actor.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant":False})
+    ref = AutoModelForCausalLM.from_pretrained("m0",**opts).to("cuda:1").eval().requires_grad_(False)
+    masters = [torch.nn.Parameter(p.detach().to(device="cpu",dtype=torch.float32)) for p in actor.parameters()]
+    optim = torch.optim.AdamW(masters,lr=1e-6,betas=(.9,.999),weight_decay=.01,foreach=False)
+    def vector(text):
+        ids = et(text,return_tensors="pt",truncation=True,max_length=4096).to(embed.device)
+        with torch.inference_mode():
+            return F.normalize(embed(**ids).last_hidden_state[0,-1].float(),dim=0).cpu()
+    def cap(text):
+        return " ".join(text.split()[:500]) if len(text.split())>500 else text
+    memory = [(r["i"],stream[r["i"]-1],cap(tok.decode(r["tokens"],skip_special_tokens=True,clean_up_tokenization_spaces=False)))
+              for r in history[:192] if r["reward"]]
+    assert len(memory)==62
+    vectors = [vector(q) for _,q,_ in memory]
+    print("models_ready",flush=True)
+    for start in (320,336):
+        begin = time.monotonic()
+        prompts = stream[start:start+16]
+        queries = [vector(x) for x in prompts]
+        similarities = torch.stack(queries) @ torch.stack(vectors).T
+        prefixes, refs = [], []
+        for prompt, scores in zip(prompts,similarities,strict=True):
+            neighbors = scores.argsort(descending=True,stable=True)[:3].tolist()
+            while True:
+                items = [f"Example Query {k}: {memory[j][1]}\n\nExample Response {k}: {memory[j][2]}" for k,j in enumerate(neighbors,1)]
+                task = template["policy"].replace("{task_description}",prompt)
+                text = "\n\n".join([template["memory"],*items,task]) if items else task
+                ids = tok.apply_chat_template([dict(role="user",content=text)],tokenize=True,add_generation_prompt=True)
+                if len(ids)<=4096: break
+                if not neighbors: raise ValueError("bare prompt too long")
+                neighbors.pop()
+            prefixes.append(dict(prompt_token_ids=ids))
+            refs.append([memory[j][0] for j in neighbors])
+        assert all(i<=start for group in refs for i in group)
+        prepared=time.monotonic()
+        params=[SamplingParams(seed=start+i,temperature=1.,top_p=1.,top_k=-1,max_tokens=1024,logprobs=0) for i in range(16)]
+        outputs=llm.generate(prefixes,params,use_tqdm=False)
+        generated=time.monotonic()
+        passages=[cap(o.outputs[0].text) for o in outputs]
+        dialogs=[[dict(role="system",content=template["judge_system"]),dict(role="user",content=template["judge_user"].replace("{response}",s))] for s in passages]
+        encoded=jt.apply_chat_template(dialogs,add_generation_prompt=True,tokenize=True,padding=True,return_tensors="pt",return_dict=True).to(judge.device)
+        with torch.inference_mode():
+            judged=judge.generate(**encoded,do_sample=False,max_new_tokens=32,pad_token_id=jt.eos_token_id)
+        verdicts=jt.batch_decode(judged[:,encoded.input_ids.size(1):],skip_special_tokens=True)
+        batch=[]; parsed=0
+        for i,(o,verdict) in enumerate(zip(outputs,verdicts,strict=True)):
+            match=re.fullmatch(r"(Classical|Cute|Chuunibyou)\s*,\s*(good|bad)\.?",verdict.strip(),re.I)
+            parsed+=int(bool(match))
+            reward=int(bool(match and match[1].lower()=="cute" and match[2].lower()=="good"))
+            out=o.outputs[0]; tokens=list(out.token_ids)
+            old=[d[t].logprob for d,t in zip(out.logprobs,tokens,strict=True)]
+            batch.append(dict(prefix=prefixes[i]["prompt_token_ids"],tokens=tokens,old=old,reward=reward))
+            if reward:
+                memory.append((start+i+1,prompts[i],passages[i]));vectors.append(queries[i])
+        scored=time.monotonic()
+        metrics=batches_update(actor,ref,optim,masters,batch,.05)
+        updated=time.monotonic()
+        publish_weights(actor,live);llm.collective_rpc("reload_weights")
+        synced=time.monotonic()
+        # These are timing-only copies. The engine now owns the updated GPU weights.
+        for f in live.glob("*.safetensors"):
+            assert not f.is_symlink()
+            f.unlink()
+        log("timings.jsonl",dict(first=start+1,n=16,parsed=parsed,refs=refs,retrieval_s=prepared-begin,
+                                 generation_s=generated-prepared,judge_s=scored-generated,update_s=updated-scored,
+                                 sync_s=synced-updated,total_s=time.monotonic()-begin,**metrics))
+    Path("done.json").write_text(json.dumps(dict(batches=2,end=time.time())))
+
+
+if __name__=="__main__":
+    main()
