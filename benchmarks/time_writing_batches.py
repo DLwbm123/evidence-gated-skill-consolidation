@@ -16,8 +16,16 @@ from run_writing_calibration import batches_update, log, publish_weights
 def main():
     root = Path(os.environ["RUN_ALIAS"])
     split = json.loads(Path("split.json").read_text())
-    mode = json.loads(Path("config.json").read_text()).get("mode")
-    controls = mode in {"rl", "memory", "snapshot"}
+    cfg = json.loads(Path("config.json").read_text())
+    mode = cfg.get("mode")
+    factorial = mode in {"joint_100", "rl_100"}
+    rl_only = mode in {"rl", "rl_100"}
+    batches = 100 if factorial else 300
+    kl = float(cfg["kl"]) if factorial else (.01 if rl_only else .05)
+    if factorial:
+        assert kl in (.01, .05)
+        from writing_reference_probe import REFERENCES, measure
+    controls = factorial or mode in {"rl", "memory", "snapshot"}
     full = mode == "full" or controls
     training = mode not in {"memory", "snapshot"}
     fixed = json.loads(Path("../c5/inputs.json").read_text()) if controls else []
@@ -128,23 +136,26 @@ def main():
                 probes(update,frozen=True,draws=4)
         Path("done.json").write_text(json.dumps(dict(end=time.time())))
         return
-    for start in (range(0,4800,16) if full else (320,336)):
+    if factorial:
+        assert set(stream + split["probe"]).isdisjoint(item[0] for item in REFERENCES)
+        log("reference.jsonl",dict(update=0,items=measure(actor,tok,template["policy"])))
+    for start in (range(0,batches*16,16) if full else (320,336)):
         begin=time.monotonic()
         width=1 if full and start<320 else 16
         batch=[];refs=[];parsed=0;times=[0.,0.,0.]
         for pos in range(start,start+16,width):
-            rows,selected,ok,elapsed=generate(stream[pos:pos+width],list(range(pos+1,pos+width+1)),use_memory=mode!="rl")
+            rows,selected,ok,elapsed=generate(stream[pos:pos+width],list(range(pos+1,pos+width+1)),use_memory=not rl_only)
             batch.extend(rows);refs.extend(selected);parsed+=ok
             times=[a+b for a,b in zip(times,elapsed,strict=True)]
         scored=time.monotonic()
-        metrics = batches_update(actor,ref,optim,masters,batch,.01 if mode=="rl" else .05) if training else {}
+        metrics = batches_update(actor,ref,optim,masters,batch,kl) if training else {}
         updated=time.monotonic()
-        if mode=="rl":
+        if rl_only:
             load_engine(llm,((name,p.detach().to("cuda:0")) for name,p in actor.named_parameters()))
         elif training:
             publish_weights(actor,live)
             llm.collective_rpc("reload_weights")
-            for f in ([] if full and start+16==4800 else live.glob("*.safetensors")):
+            for f in ([] if mode=="full" and start+16==4800 else live.glob("*.safetensors")):
                 assert not f.is_symlink()
                 f.unlink()
         synced=time.monotonic()
@@ -152,11 +163,13 @@ def main():
                                  generation_s=times[1],judge_s=times[2],update_s=updated-scored,
                                  sync_s=synced-updated,total_s=time.monotonic()-begin,**metrics))
         update=start//16+1
+        if factorial and update%10==0:
+            log("reference.jsonl",dict(update=update,items=measure(actor,tok,template["policy"])))
         if full and update%50==0:
-            probes(update,frozen=mode=="rl",draws=4 if controls else 1)
+            probes(update,frozen=rl_only or factorial,draws=4 if controls else 1)
     if mode=="rl":
         store_delta(actor,Path("m0"),Path("final_delta"))
-    Path("done.json").write_text(json.dumps(dict(batches=300 if full else 2,end=time.time())))
+    Path("done.json").write_text(json.dumps(dict(batches=batches if full else 2,end=time.time())))
 
 
 if __name__=="__main__":
