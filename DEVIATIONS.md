@@ -5,4 +5,4 @@
 - **原版 trainer 的 checkpoint 验收**。短任务保存后，用启动的第二个 trainer 进程在验证模式重载模型与投影头。保留作者的有填充 actor 路径，只在实际去填充时才导入 FlashAttention 的辅助函数。
 - **GRPO 导入兼容**。匿名 trainer 包缺少 GiGPO 模块。将该模块延迟至选择 GiGPO 优势时导入，保留 GRPO 路径原有计算和评测。
 
-- **FSOL Writing 的隐藏目标与绝对成绩**。本地在运行前选定 Cute 且质量为 good 作为平稳流的成功条件。《Fast and Slow Online Learning for Agents》表 1 报告零样本 17.9%，正文与附录给出了三个候选风格和评分量表，未能核实作者平稳流究竟奖励哪种风格。本地无记忆评测明显偏向 Chuunibyou，仅凭两边的零样本比例不能反推出作者的目标风格。作者题序、查询子集与本地划分的对应关系也未确认。[诊断与配对对照](reports/WRITING_KL_FOLLOWUP.md)
+- **FSOL Writing 的隐藏目标与绝对成绩**。本地在运行前选定 Cute 且质量为 good 作为平稳流的成功条件。《Fast and Slow Online Learning for Agents》表 1 报告零样本 17.9%，正文与附录给出了三个候选风格和评分量表，未能核实作者平稳流究竟奖励哪种风格。按同一批 200 个本地零样本回答重计（全部通过质量检查），若奖励 Classical、Cute、Chuunibyou，命中率分别是 3.5%、26.5%、70.0%，与论文 17.9% 分别相差 14.4、8.6、52.1 个百分点。Cute 在本地三种候选中最近，从数值上与预先选择相容；仍无法据此确认作者用的风格。作者题序、查询子集与本地划分的对应关系也未确认。[诊断与配对对照](reports/WRITING_KL_FOLLOWUP.md)

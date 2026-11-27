@@ -25,6 +25,7 @@ def batches_update(actor, ref, optimizer, masters, rows, kl_coefficient):
     count = sum(len(r["tokens"]) for r in rows)
     actor.zero_grad(set_to_none=True)
     observed_loss = 0.
+    components = rewards.new_zeros(2, device=actor.device)
     for row, advantage in zip(rows, advantages):
         obs = row["prefix"]
         actions = row["tokens"]
@@ -39,7 +40,10 @@ def batches_update(actor, ref, optimizer, masters, rows, kl_coefficient):
         mask = torch.ones_like(current)
         pg = compute_policy_loss(old, current, advantage.to(current.device).expand_as(current),
                                  mask, cliprange=.2, clip_ratio_c=float(1e8))[0]
-        loss = (pg + kl_coefficient * kl_penalty(current, reference, "low_var_kl").mean()) * (len(actions)/count)
+        kl = kl_penalty(current, reference, "low_var_kl").mean()
+        fraction = len(actions)/count
+        loss = (pg + kl_coefficient * kl) * fraction
+        components += torch.stack((pg.detach(), kl.detach())).reshape(2) * fraction
         loss.backward()
         observed_loss += loss.detach().item()
     norm = torch.nn.utils.clip_grad_norm_(actor.parameters(), 1., error_if_nonfinite=True).item()
@@ -51,7 +55,10 @@ def batches_update(actor, ref, optimizer, masters, rows, kl_coefficient):
         for param, master in zip(actor.parameters(), masters, strict=True):
             param.copy_(master)
         optimizer.zero_grad(set_to_none=True)
-    return dict(loss=observed_loss, grad_norm=norm, tokens=count, rewards=int(rewards.sum()))
+    policy_loss, kl_mean = components.tolist()
+    return dict(loss=observed_loss, pg_loss=policy_loss, kl_mean=kl_mean,
+                weighted_kl=kl_coefficient * kl_mean, grad_norm=norm,
+                zero_advantage=bool(torch.all(advantages == 0)), tokens=count, rewards=int(rewards.sum()))
 
 
 def publish_weights(actor, live):
