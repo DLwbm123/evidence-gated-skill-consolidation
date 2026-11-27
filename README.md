@@ -2,6 +2,8 @@
 
 研究交互式强化学习中应在何时将技能库中的经验巩固进策略模型。计划用技能掌握度选择训练样本，以事后技能为教师上下文对齐策略的隐藏状态，并在关闭技能库时评估内化效果。当前代码覆盖 ALFWorld 的任务分组、表示对齐诊断及双卡训练验收。[实验进展](reports/PROGRESS.md)
 
+Writing 的纯 RL、纯记忆和 FSOL 对照结果见[阶段报告及逐题数据](reports/WRITING_INTERIM.md)。
+
 ## 入口和依赖
 
 - `benchmarks/prepare_alfworld_families.py` 使用 Python 标准库，输入包含 `official_split`、`game_file` 和 `task_type` 的逐行 JSON 清单。游戏文件须能从清单上两级目录按 `game_file` 解析。
